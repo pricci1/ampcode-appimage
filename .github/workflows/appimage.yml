@@ -1,0 +1,107 @@
+name: AppImage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check authenticated upstream version
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(./build.sh --check-version)
+          build=true
+          publish=false
+          if [[ "$GITHUB_REF" == refs/heads/main && ( "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ) ]]; then
+            build=$(./release.sh check "$version")
+            publish=$build
+          fi
+          printf 'version=%s\nbuild=%s\npublish=%s\n' "$version" "$build" "$publish" >> "$GITHUB_OUTPUT"
+          if [[ "$build" == false ]]; then
+            echo "Amp $version is already published; skipping build." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install build and validation tools
+        if: steps.plan.outputs.build == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl gnupg gpgv dpkg coreutils shellcheck desktop-file-utils
+
+      - name: Validate scripts and release handling
+        if: steps.plan.outputs.build == 'true'
+        run: |
+          shellcheck build.sh AppRun release.sh tests/release.sh
+          for script in build.sh release.sh tests/release.sh; do bash -n "$script"; done
+          sh -n AppRun
+          ./tests/release.sh
+
+      - name: Build and inspect AppImage
+        if: steps.plan.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          ./build.sh
+          image="Amp-$VERSION-x86_64.AppImage"
+          # If upstream changed during the run, fail safely and retry next hour.
+          test -s "dist/$image"
+          (cd dist && sha256sum --check "$image.sha256")
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/dist/$image" --appimage-extract >/dev/null)
+          cmp AppRun "$RUNNER_TEMP/squashfs-root/AppRun"
+          desktop-file-validate "$RUNNER_TEMP/squashfs-root/amp-desktop.desktop"
+          test -s "$RUNNER_TEMP/squashfs-root/amp-desktop.png"
+          echo "Built and validated Amp $VERSION (x86-64)." >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.plan.outputs.build == 'true'
+        with:
+          name: Amp-${{ steps.plan.outputs.version }}-x86_64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    needs: build
+    if: >-
+      needs.build.outputs.publish == 'true' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: Amp-${{ needs.build.outputs.version }}-x86_64
+          path: dist
+      - name: Publish release after all assets are uploaded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: ./release.sh publish "$VERSION" "$GITHUB_SHA"

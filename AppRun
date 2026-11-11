@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+# The runtime sets APPDIR; resolving this script also permits an extracted AppDir.
+APPDIR=${APPDIR:-$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)}
+exec "$APPDIR/opt/amp/amp-desktop" "$@"
